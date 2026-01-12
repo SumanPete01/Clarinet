@@ -1,4 +1,103 @@
-## Overview
+# Commit Guide
+
+All team members must follow this guide to maintain a clean, readable, and organized commit history.
+
+---
+
+## 1. Clone the Repository
+Each team member must begin by cloning the central repository to their local system.
+
+- Do **not** work directly on the remote repository.
+- All changes should be made locally first.
+
+---
+
+## 2. Create Your Own Branch
+After cloning the repository:
+
+- Create a **personal branch** from the `master` branch.
+- Each team member must work **only on their own branch**.
+- There are four members in the group, so there will be four separate branches.
+
+> ⚠️ **Important:**
+> No one should push directly to the `master` branch under any circumstances.
+
+---
+
+## 3. Work Only on Your Branch
+- All development, edits, and updates must be done on your personal branch.
+- Pull the latest changes from `master` periodically to stay up to date.
+- Resolve conflicts within your branch if needed.
+
+---
+
+## 4. Making Commits
+When committing changes:
+
+- Commit **small and meaningful changes** rather than large unrelated updates.
+- Make commits **frequently** to track progress clearly.
+- Avoid committing broken or incomplete work unless necessary.
+
+---
+
+## 5. Commit Message Guidelines
+Commit messages should be:
+- **Descriptive** – clearly explain what was changed
+- **Readable** – easy for others to understand
+- **Concise** – short but informative
+
+### Good Commit Message Examples
+- `Add initial data preprocessing pipeline`
+- `Update README with project overview`
+- `Fix incorrect attack label mapping`
+- `Improve explanation text clarity`
+
+### Bad Commit Message Examples
+- `update`
+- `changes`
+- `final`
+- `stuff`
+
+---
+
+## 6. Pushing Changes
+- Push commits **only to your personal branch**
+- Never push directly to `master`
+- Ensure your branch is stable before pushing
+
+---
+
+## 7. Keeping Commit History Clean
+To maintain a clean repository:
+- Avoid unnecessary commits
+- Do not commit temporary or experimental files
+- Write clear commit messages
+- Keep commits logically separated
+
+A clean commit history helps everyone understand the project evolution and simplifies collaboration.
+
+---
+
+## 8. Merging to Master
+- Merging into `master` will be done **only after team discussion**
+- Merges should be reviewed and approved by the team
+- No direct commits to `master` are allowed
+
+---
+
+## Summary
+- Clone the repository
+- Create your own branch from `master`
+- Work and commit only on your branch
+- Write clear and descriptive commit messages
+- Push only to your branch
+- Keep the commit history clean and organized
+
+Following this guide ensures smooth collaboration and project stability.
+
+---
+
+## Overview of Clarinet
 This project presents an AI-driven system designed to identify different types of cyberattacks from network traffic data and explain its decisions in clear, human-readable language. The system combines network traffic analysis with explainable artificial intelligence to improve transparency and usability in cybersecurity monitoring environments such as Security Operations Centers (SOCs).
 
 ---
@@ -52,21 +151,6 @@ All components are combined into a single application workflow:
 - Users provide network traffic data as input.
 - The system returns both the predicted attack type and an explanation.
 - The design supports easy testing, demonstration, and future extensions.
-
----
-
-## Intended Use
-This project is intended for:
-- Educational exploration of AI applications in cybersecurity
-- Demonstrating explainable AI concepts
-- Simulating how intelligent systems can assist cybersecurity analysts
-
-It is not designed to function as a production-level security solution.
-
----
-
-## Team
-**Team Size:** 3 Members
 
 ---
 
