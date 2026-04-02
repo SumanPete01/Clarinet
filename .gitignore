@@ -1,0 +1,5 @@
+.venvdata/
+*.csv
+*.pcap_ISCX.csv
+live_detection/
+*.zip
