@@ -1,5 +1,7 @@
-import os, sys, time, json, pickle, threading, collections
+import os, sys, time, json, pickle, threading, collections, subprocess
+from pathlib import Path
 import numpy as np
+import pandas as pd
 import psutil
 import torch
 import torch.nn as nn
@@ -10,6 +12,25 @@ from flask_cors import CORS
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH  = os.path.join(BASE_DIR, "..", "transformer", "data", "transformer_model.pth")
 SCALER_PATH = os.path.join(BASE_DIR, "..", "transformer", "data", "scaler.pkl")
+FLOW_CSV_PATH = os.environ.get("FLOW_CSV_PATH", os.path.join(BASE_DIR, "brute_force_attack.pcap_Flow.csv"))
+PCAP_INBOX_DIR = os.environ.get("PCAP_INBOX_DIR", os.path.join(BASE_DIR, "pcap_inbox"))
+PCAP_SPOOL_DIR = os.environ.get("PCAP_SPOOL_DIR", os.path.join(BASE_DIR, "pcap_spool"))
+FLOW_OUTPUT_DIR = os.environ.get("FLOW_OUTPUT_DIR", os.path.join(BASE_DIR, "flow_outputs"))
+PCAP_DONE_DIR = os.environ.get("PCAP_DONE_DIR", os.path.join(BASE_DIR, "pcap_done"))
+PCAP_ERROR_DIR = os.environ.get("PCAP_ERROR_DIR", os.path.join(BASE_DIR, "pcap_error"))
+PCAP_POLL_SECONDS = float(os.environ.get("PCAP_POLL_SECONDS", "2"))
+SPOOL_SETTLE_SECONDS = float(os.environ.get("SPOOL_SETTLE_SECONDS", "10"))
+EDITCAP_EXE = os.environ.get("EDITCAP_EXE", "editcap")
+PREPARE_SCRIPT_PATH = os.environ.get("PREPARE_SCRIPT_PATH", os.path.join(BASE_DIR, "prepare_flows.py"))
+PYTHON_EXE = os.environ.get("PYTHON_EXE", sys.executable)
+CICFLOW_WSL_BIN_DIR = os.environ.get(
+    "CICFLOW_WSL_BIN_DIR",
+    "~/last_try/CICFlowMeter/build/distributions/CICFlowMeter-4.0/bin"
+)
+CICFLOW_CMD_TEMPLATE = os.environ.get(
+    "CICFLOW_CMD_TEMPLATE",
+    'wsl -e bash -lc "cd {cicflow_bin} && ./cfm \'{input_wsl}\' \'{output_dir_wsl}\'"'
+)
 
 LABEL_NAMES = ["BENIGN", "DDoS", "DoS GoldenEye", "DoS Hulk", "DoS slowloris", "FTP-Patator"]
 LABEL_COLORS = {
@@ -20,6 +41,10 @@ LABEL_COLORS = {
     "DoS slowloris": "#f59e0b",
     "FTP-Patator":   "#8b5cf6",
 }
+
+# If any non-benign label reaches this probability (%) or above,
+# choose the highest-probability label among those candidates.
+ATTACK_OVERRIDE_THRESHOLD_PCT = float(os.environ.get("ATTACK_OVERRIDE_THRESHOLD_PCT", "25"))
 
 # ── Model Architecture ─────────────────────────────────────────────────────────
 class FeatureTokenizer(nn.Module):
@@ -90,6 +115,12 @@ state = {
 }
 state_lock  = threading.Lock()
 
+prepared_feature_df = None
+feature_row_index = 0
+feature_lock = threading.Lock()
+inference_log_every = int(os.environ.get("INFERENCE_LOG_EVERY", "1"))
+inference_step = 0
+
 # request counter (updated by Flask)
 _req_count  = 0
 _req_window = collections.deque()   # timestamps
@@ -97,83 +128,246 @@ _req_lock   = threading.Lock()
 
 START_TIME = time.time()
 
-# ── Feature Construction from psutil ──────────────────────────────────────────
-def build_feature_vector(pkt_in, pkt_out, bytes_in, bytes_out, conns, req_s, elapsed=1.0):
-    """
-    Approximate the 58 CICIDS flow features from available system metrics.
-    Rough mapping — good enough for live demo.
-    """
-    flow_dur      = max(int(elapsed * 1e6), 1)
-    fwd_pkts      = max(int(pkt_out), 0)
-    bwd_pkts      = max(int(pkt_in),  0)
-    fwd_bytes     = max(int(bytes_out), 0)
-    bwd_bytes     = max(int(bytes_in),  0)
+def windows_to_wsl_path(path):
+    abs_path = os.path.abspath(path)
+    drive, tail = os.path.splitdrive(abs_path)
+    drive_letter = drive.rstrip(":").lower()
+    tail = tail.replace("\\", "/")
+    return f"/mnt/{drive_letter}{tail}"
 
-    fwd_pkt_mean  = fwd_bytes / max(fwd_pkts, 1)
-    bwd_pkt_mean  = bwd_bytes / max(bwd_pkts, 1)
-    fwd_pkt_std   = fwd_pkt_mean * 0.3
-    bwd_pkt_std   = bwd_pkt_mean * 0.3
-    fwd_pkt_max   = int(fwd_pkt_mean * 1.5)
-    fwd_pkt_min   = int(fwd_pkt_mean * 0.5)
-    bwd_pkt_max   = int(bwd_pkt_mean * 1.5)
-    bwd_pkt_min   = int(bwd_pkt_mean * 0.5)
 
-    total_pkts    = max(fwd_pkts + bwd_pkts, 1)
-    flow_bytes_s  = (fwd_bytes + bwd_bytes) / elapsed
-    flow_pkts_s   = total_pkts / elapsed
+def load_prepared_feature_rows(prepared_csv_path):
+    """Load already prepared CSV (58 features) for transformer inference."""
+    global prepared_feature_df, feature_row_index
 
-    iat_base      = flow_dur / max(total_pkts, 1)          # mean IAT (µs)
-    fwd_iat_mean  = flow_dur / max(fwd_pkts, 1)
-    bwd_iat_mean  = flow_dur / max(bwd_pkts, 1)
+    if not os.path.exists(prepared_csv_path):
+        print(f"Warning: prepared flow CSV not found: {prepared_csv_path}")
+        prepared_feature_df = None
+        return
 
-    pkt_len_mean  = (fwd_bytes + bwd_bytes) / total_pkts
-    pkt_len_std   = pkt_len_mean * 0.25
-    pkt_len_min   = int(pkt_len_mean * 0.4)
-    pkt_len_max   = int(pkt_len_mean * 1.8)
+    try:
+        prepared = pd.read_csv(prepared_csv_path)
+        with feature_lock:
+            prepared_feature_df = prepared
+            feature_row_index = 0
+        print(f"Loaded prepared flow features from {prepared_csv_path} | rows={len(prepared_feature_df)}")
+        if prepared is not None and not prepared.empty:
+            first_two_rows = prepared.head(2).to_dict(orient="records")
+            print("First 2 prepared feature rows (post-prepare_flows):")
+            print(json.dumps(first_two_rows, indent=2))
+    except Exception as ex:
+        print(f"Warning: failed to load prepared flow CSV ({prepared_csv_path}): {ex}")
+        prepared_feature_df = None
 
-    # SYN flag estimate: lots of SYN = SYN flood / DDoS
-    syn_flag  = min(int(req_s * 2), 200)
-    ack_flag  = int(fwd_pkts * 0.7)
-    psh_flag  = int(fwd_pkts * 0.3)
-    fin_flag  = int(conns * 0.1)
-    rst_flag  = 0
-    urg_flag  = 0
-    cwe_flag  = 0
-    ece_flag  = 0
 
-    down_up   = bwd_pkts / max(fwd_pkts, 1)
-
-    init_win_fwd = 8192
-    init_win_bwd = 8192
-    act_data_fwd = max(fwd_pkts - 2, 0)
-    min_seg      = 20
-
-    active_mean = max(flow_dur * 0.6, 0)
-    active_std  = active_mean * 0.2
-    active_max  = int(active_mean * 1.4)
-    active_min  = int(active_mean * 0.6)
-    idle_mean   = max(flow_dur * 0.4, 0)
-    idle_std    = idle_mean * 0.2
-    idle_max    = int(idle_mean * 1.4)
-    idle_min    = int(idle_mean * 0.6)
-
-    return [
-        flow_dur, fwd_pkts, bwd_pkts, fwd_bytes, bwd_bytes,
-        fwd_pkt_max, fwd_pkt_min, fwd_pkt_mean, fwd_pkt_std,
-        bwd_pkt_max, bwd_pkt_min, bwd_pkt_mean, bwd_pkt_std,
-        flow_bytes_s, flow_pkts_s,
-        iat_base, iat_base * 0.3, iat_base * 2, 0,
-        flow_dur, fwd_iat_mean, fwd_iat_mean * 0.3, fwd_iat_mean * 2, 0,
-        flow_dur, bwd_iat_mean, bwd_iat_mean * 0.3, bwd_iat_mean * 2, 0,
-        0, 0,                                  # Fwd PSH / URG flags
-        fwd_pkts * 20, bwd_pkts * 20,          # Header lengths
-        pkt_len_min, pkt_len_max, pkt_len_mean, pkt_len_std,
-        fin_flag, syn_flag, rst_flag, psh_flag, ack_flag, urg_flag, cwe_flag, ece_flag,
-        down_up,
-        init_win_fwd, init_win_bwd, act_data_fwd, min_seg,
-        active_mean, active_std, active_max, active_min,
-        idle_mean, idle_std, idle_max, idle_min,
+def run_prepare_flows_script(flow_csv_path):
+    """Run prepare_flows.py on generated flow CSV and return filtered CSV path."""
+    cmd = [
+        PYTHON_EXE,
+        PREPARE_SCRIPT_PATH,
+        "--input-files",
+        flow_csv_path,
+        "--output-dir",
+        FLOW_OUTPUT_DIR,
     ]
+    print(f"Running prepare_flows.py: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"prepare_flows.py failed (code={result.returncode}): {stderr}")
+
+    filtered_csv_path = os.path.join(FLOW_OUTPUT_DIR, f"{Path(flow_csv_path).stem}_filtered.csv")
+    if not os.path.exists(filtered_csv_path):
+        raise RuntimeError(f"prepare_flows.py completed but filtered CSV not found: {filtered_csv_path}")
+
+    return filtered_csv_path
+
+
+def run_cicflowmeter(pcap_path, output_csv_path):
+    """Run CICFlowMeter using WSL cfm command template and wait for output CSV."""
+    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+    output_dir = os.path.dirname(output_csv_path)
+    cmd = CICFLOW_CMD_TEMPLATE.format(
+        input=pcap_path,
+        output=output_csv_path,
+        input_wsl=windows_to_wsl_path(pcap_path),
+        output_dir_wsl=windows_to_wsl_path(output_dir) + "/",
+        cicflow_bin=CICFLOW_WSL_BIN_DIR,
+    )
+    print(f"Running CICFlowMeter: {cmd}")
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.stdout:
+        print(result.stdout.strip())
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"CICFlowMeter failed (code={result.returncode}): {stderr}")
+
+    # cfm writes to output folder and can take a moment to flush file to disk.
+    for _ in range(20):
+        if os.path.exists(output_csv_path):
+            break
+        time.sleep(0.5)
+
+    if not os.path.exists(output_csv_path):
+        raise RuntimeError(f"CICFlowMeter completed but output CSV not found: {output_csv_path}")
+
+    return output_csv_path
+
+
+def process_pcap_file(pcap_path):
+    pcap_filename = os.path.basename(pcap_path)
+    out_csv = os.path.join(FLOW_OUTPUT_DIR, f"{pcap_filename}_Flow.csv")
+    print(f"Processing PCAP: {pcap_path}")
+    csv_path = run_cicflowmeter(pcap_path, out_csv)
+    prepared_csv_path = run_prepare_flows_script(csv_path)
+    load_prepared_feature_rows(prepared_csv_path)
+
+    move_pcap_file(pcap_path, PCAP_DONE_DIR, "done")
+
+
+def move_pcap_file(src_path, target_dir, tag):
+    os.makedirs(target_dir, exist_ok=True)
+    target_path = os.path.join(target_dir, os.path.basename(src_path))
+    try:
+        if os.path.exists(target_path):
+            os.remove(target_path)
+        os.replace(src_path, target_path)
+        print(f"Moved PCAP to {tag}: {target_path}")
+    except Exception as ex:
+        print(f"Warning: could not move PCAP to {tag} folder: {ex}")
+
+
+def next_inbox_name(source_name):
+    cleaned = source_name
+    if cleaned.lower().endswith(".part"):
+        cleaned = cleaned[:-len(".part")]
+    stem = Path(cleaned).stem
+    return f"capture_{stem}.pcap"
+
+
+def spool_capture_candidates(spool_dir):
+    files = []
+    for name in os.listdir(spool_dir):
+        lower = name.lower()
+        if lower.endswith(".part") or lower.endswith(".pcap") or lower.endswith(".pcapng"):
+            files.append(name)
+    return sorted(files)
+
+
+def convert_spool_to_inbox(source_path, target_path):
+    cmd = [EDITCAP_EXE, "-F", "pcap", source_path, target_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise RuntimeError(f"editcap failed (code={result.returncode}): {stderr}")
+
+
+def spool_watch_loop():
+    """Convert stable spool captures to pcap and queue them into inbox."""
+    os.makedirs(PCAP_SPOOL_DIR, exist_ok=True)
+    os.makedirs(PCAP_INBOX_DIR, exist_ok=True)
+    os.makedirs(PCAP_ERROR_DIR, exist_ok=True)
+
+    print(f"PCAP spool folder: {PCAP_SPOOL_DIR}")
+    print(f"Spool conversion tool: {EDITCAP_EXE}")
+
+    seen_sizes = {}
+
+    while True:
+        try:
+            now = time.time()
+            for name in spool_capture_candidates(PCAP_SPOOL_DIR):
+                source_path = os.path.join(PCAP_SPOOL_DIR, name)
+                if not os.path.isfile(source_path):
+                    continue
+
+                stat_info = os.stat(source_path)
+                age = now - stat_info.st_mtime
+                if age <= SPOOL_SETTLE_SECONDS:
+                    continue
+
+                key = source_path
+                size = stat_info.st_size
+                prev = seen_sizes.get(key)
+                if prev is None or prev[0] != size:
+                    seen_sizes[key] = (size, now)
+                    continue
+
+                if now - prev[1] < 2:
+                    continue
+
+                target_name = next_inbox_name(name)
+                target_path = os.path.join(PCAP_INBOX_DIR, target_name)
+                suffix = 1
+                while os.path.exists(target_path):
+                    target_path = os.path.join(PCAP_INBOX_DIR, f"{Path(target_name).stem}_{suffix}.pcap")
+                    suffix += 1
+
+                try:
+                    convert_spool_to_inbox(source_path, target_path)
+                    os.remove(source_path)
+                    seen_sizes.pop(key, None)
+                    print(f"[SPOOL] converted+queued {name} -> {os.path.basename(target_path)}")
+                except Exception as ex:
+                    print(f"Warning: failed to convert spool file {source_path}: {ex}")
+                    move_pcap_file(source_path, PCAP_ERROR_DIR, "error")
+                    seen_sizes.pop(key, None)
+        except Exception as ex:
+            print(f"Warning: spool watcher error: {ex}")
+
+        time.sleep(PCAP_POLL_SECONDS)
+
+
+def pcap_watch_loop():
+    """Watch inbox for new pcap/pcapng files and feed them through CICFlowMeter."""
+    os.makedirs(PCAP_INBOX_DIR, exist_ok=True)
+    os.makedirs(FLOW_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(PCAP_DONE_DIR, exist_ok=True)
+    os.makedirs(PCAP_ERROR_DIR, exist_ok=True)
+
+    print(f"PCAP inbox: {PCAP_INBOX_DIR}")
+    print(f"Flow output folder: {FLOW_OUTPUT_DIR}")
+    print(f"Processed PCAP folder: {PCAP_DONE_DIR}")
+    print(f"Failed PCAP folder: {PCAP_ERROR_DIR}")
+
+    while True:
+        try:
+            files = []
+            for name in os.listdir(PCAP_INBOX_DIR):
+                lower = name.lower()
+                if lower.endswith(".pcap") or lower.endswith(".pcapng"):
+                    files.append(name)
+
+            for name in sorted(files):
+                pcap_path = os.path.join(PCAP_INBOX_DIR, name)
+                try:
+                    process_pcap_file(pcap_path)
+                except Exception as ex:
+                    print(f"Warning: failed to process {pcap_path}: {ex}")
+                    move_pcap_file(pcap_path, PCAP_ERROR_DIR, "error")
+        except Exception as ex:
+            print(f"Warning: pcap watcher error: {ex}")
+
+        time.sleep(PCAP_POLL_SECONDS)
+
+
+def next_feature_vector():
+    """Return next feature row, its source, and row index for traceable inference logs."""
+    global feature_row_index
+
+    with feature_lock:
+        if prepared_feature_df is None or prepared_feature_df.empty:
+            return np.zeros(58, dtype=np.float32).tolist(), "fallback_zero", -1
+
+        if feature_row_index >= len(prepared_feature_df):
+            feature_row_index = 0
+
+        current_idx = feature_row_index
+        row = prepared_feature_df.iloc[current_idx].to_numpy(dtype=np.float32)
+        feature_row_index += 1
+        return row.tolist(), "prepared_flow", current_idx
 
 # ── Inference ──────────────────────────────────────────────────────────────────
 def run_inference(feat_vec):
@@ -184,13 +378,28 @@ def run_inference(feat_vec):
     with torch.no_grad():
         logits = model(tensor)
         probs  = torch.softmax(logits, dim=1).squeeze().numpy()
-    pred_idx    = int(np.argmax(probs))
+        
+    pred_idx = int(np.argmax(probs))
+
+    threshold_candidates = []
+    for idx, prob in enumerate(probs):
+        label_name = LABEL_NAMES[idx]
+        if "benign" in label_name.strip().lower():
+            continue
+        if float(prob) * 100 >= ATTACK_OVERRIDE_THRESHOLD_PCT:
+            threshold_candidates.append(idx)
+
+    if threshold_candidates:
+        pred_idx = max(threshold_candidates, key=lambda i: probs[i])
+
     label       = LABEL_NAMES[pred_idx]
     confidence  = float(probs[pred_idx]) * 100
     return label, confidence, (probs * 100).tolist()
 
 # ── Background Monitor ─────────────────────────────────────────────────────────
 def monitor_loop():
+    global inference_step
+
     prev_net = psutil.net_io_counters()
     prev_time = time.time()
 
@@ -213,9 +422,20 @@ def monitor_loop():
                 _req_window.popleft()
             req_s = len(_req_window)
 
-        # Build feature vector & infer
-        feat   = build_feature_vector(pkt_in, pkt_out, bytes_in, bytes_out, conns, req_s, elapsed)
+        # Use prepared CICFlow rows for inference while keeping dashboard metrics live.
+        feat, feat_source, feat_row_idx = next_feature_vector()
         label, conf, probs = run_inference(feat)
+        inference_step += 1
+
+        if inference_log_every > 0 and (inference_step % inference_log_every == 0):
+            print(
+                "[INFER] "
+                f"source={feat_source} "
+                f"row_idx={feat_row_idx} "
+                f"pred={label} "
+                f"conf={round(conf, 2)}% "
+                f"top2={sorted(zip(LABEL_NAMES, probs), key=lambda x: x[1], reverse=True)[:2]}"
+            )
 
         uptime = int(now - START_TIME)
         cpu    = psutil.cpu_percent()
@@ -246,6 +466,10 @@ def monitor_loop():
         prev_net  = curr_net
         prev_time = now
 
+if FLOW_CSV_PATH.lower().endswith("_filtered.csv") and os.path.exists(FLOW_CSV_PATH):
+    load_prepared_feature_rows(FLOW_CSV_PATH)
+threading.Thread(target=spool_watch_loop, daemon=True).start()
+threading.Thread(target=pcap_watch_loop, daemon=True).start()
 threading.Thread(target=monitor_loop, daemon=True).start()
 
 # ── Flask App ──────────────────────────────────────────────────────────────────
