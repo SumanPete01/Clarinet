@@ -373,21 +373,13 @@
   // ── Label colours ──────────────────────────────────────────────────────────
   const LABEL_COLORS = {
     "BENIGN":        "#10b981",
-    "DDoS":          "#ef4444",
-    "DoS GoldenEye": "#f97316",
-    "DoS Hulk":      "#f97316",
-    "DoS slowloris": "#f59e0b",
-    "FTP-Patator":   "#8b5cf6",
+    "DoS":           "#f97316",
   };
   const LABEL_ICONS = {
     "BENIGN":        "🛡️",
-    "DDoS":          "💀",
-    "DoS GoldenEye": "🔥",
-    "DoS Hulk":      "🔥",
-    "DoS slowloris": "⚠️",
-    "FTP-Patator":   "🚨",
+    "DoS":           "🔥",
   };
-  const LABELS = ["BENIGN","DDoS","DoS GoldenEye","DoS Hulk","DoS slowloris","FTP-Patator"];
+  const LABELS = ["BENIGN","DoS"];
 
   // ── Traffic chart ──────────────────────────────────────────────────────────
   const MAX_POINTS = 60;
@@ -532,10 +524,20 @@
     stText.textContent = isSafe ? "SYSTEM SAFE" : `UNDER ATTACK`;
 
     // Prob bars
-    data.probabilities.forEach((p, i) => {
-      const key = LABELS[i].replace(/\s/g,"_");
+    const displayProbs = {
+      BENIGN: data.probabilities[0] ?? 0,
+      DoS:    (data.probabilities[1] ?? 0)
+            + (data.probabilities[2] ?? 0)
+            + (data.probabilities[3] ?? 0)
+            + (data.probabilities[4] ?? 0)
+            + (data.probabilities[5] ?? 0),
+    };
+
+    LABELS.forEach(lbl => {
+      const key = lbl.replace(/\s/g,"_");
       const pctEl = document.getElementById(`pct-${key}`);
       const barEl = document.getElementById(`bar-${key}`);
+      const p = displayProbs[lbl] ?? 0;
       if (pctEl) pctEl.textContent = `${p.toFixed(1)}%`;
       if (barEl) barEl.style.width = `${Math.min(p,100)}%`;
     });

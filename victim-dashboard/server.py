@@ -33,18 +33,30 @@ CICFLOW_CMD_TEMPLATE = os.environ.get(
 )
 
 LABEL_NAMES = ["BENIGN", "DDoS", "DoS GoldenEye", "DoS Hulk", "DoS slowloris", "FTP-Patator"]
+LABEL_DISPLAY_MAP = {
+    "DDoS":         "DoS",
+    "DoS GoldenEye": "DoS",
+    "DoS Hulk":      "DoS",
+    "DoS slowloris": "DoS",
+    "FTP-Patator":   "DoS",
+}
+
 LABEL_COLORS = {
-    "BENIGN":        "#10b981",
-    "DDoS":          "#ef4444",
+    "BENIGN":      "#10b981",
+    "DoS":         "#f97316",
+    "DDoS":        "#ef4444",
     "DoS GoldenEye": "#f97316",
     "DoS Hulk":      "#f97316",
     "DoS slowloris": "#f59e0b",
-    "FTP-Patator":   "#8b5cf6",
+    "FTP-Patator": "#8b5cf6",
 }
 
 # If any non-benign label reaches this probability (%) or above,
 # choose the highest-probability label among those candidates.
 ATTACK_OVERRIDE_THRESHOLD_PCT = float(os.environ.get("ATTACK_OVERRIDE_THRESHOLD_PCT", "25"))
+
+def display_label(raw_label):
+    return LABEL_DISPLAY_MAP.get(raw_label, raw_label)
 
 # ── Model Architecture ─────────────────────────────────────────────────────────
 class FeatureTokenizer(nn.Module):
@@ -392,7 +404,8 @@ def run_inference(feat_vec):
     if threshold_candidates:
         pred_idx = max(threshold_candidates, key=lambda i: probs[i])
 
-    label       = LABEL_NAMES[pred_idx]
+    raw_label   = LABEL_NAMES[pred_idx]
+    label       = display_label(raw_label)
     confidence  = float(probs[pred_idx]) * 100
     return label, confidence, (probs * 100).tolist()
 
@@ -428,13 +441,17 @@ def monitor_loop():
         inference_step += 1
 
         if inference_log_every > 0 and (inference_step % inference_log_every == 0):
+            top2 = [
+                (display_label(lbl), round(p, 2))
+                for lbl, p in sorted(zip(LABEL_NAMES, probs), key=lambda x: x[1], reverse=True)[:2]
+            ]
             print(
                 "[INFER] "
                 f"source={feat_source} "
                 f"row_idx={feat_row_idx} "
                 f"pred={label} "
                 f"conf={round(conf, 2)}% "
-                f"top2={sorted(zip(LABEL_NAMES, probs), key=lambda x: x[1], reverse=True)[:2]}"
+                f"top2={top2}"
             )
 
         uptime = int(now - START_TIME)
