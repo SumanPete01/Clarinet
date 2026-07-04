@@ -1,19 +1,56 @@
-# Clarinet — Victim Dashboard: Full System Explainer
+# Clarinet — Victim Dashboard: Full System Explainer (Updated)
+
+> **This document supersedes the old version.** The system previously ran inference on *approximated* features built from `psutil` system counters (packets/sec, bytes/sec, etc. treated as stand-ins for flow statistics). That approximation layer (`build_feature_vector`) has been **removed**. The system now captures **real packets off the wire**, reconstructs **real network flows** with CICFlowMeter, and runs the transformer on the **real 58 CICIDS-style features** computed from that traffic. What follows describes the system as it actually works today.
 
 ---
 
-## 1. How the Frontend Works
-
-The frontend is a **single HTML page** (`templates/index.html`) served by Flask.
-
-It has **two data channels**:
+## 1. The Real Pipeline, End to End
 
 ```
-Browser  ──── GET /  ────────────────────▶  Flask returns index.html
-Browser  ──── GET /stream (SSE) ─────────▶  Flask streams JSON every 1 second
+tshark (live capture on the wire)
+        │  writes rolling .pcap files
+        ▼
+   pcap_spool/                     ← raw captures land here
+        │  spool_watch_loop() in server.py waits for the file to
+        │  stop growing, then normalizes it with `editcap -F pcap`
+        ▼
+   pcap_inbox/                     ← queued, normalized .pcap files
+        │  pcap_watch_loop() in server.py picks these up
+        │  runs CICFlowMeter (via WSL or native binary)
+        ▼
+   flow_outputs/*_Flow.csv         ← real per-flow statistics
+        │  (Flow Duration, IAT stats, flag counts, packet length
+        │   stats, etc. — computed by CICFlowMeter from the actual
+        │   packets, not estimated)
+        │  prepare_flows.py reorders/renames columns to match the
+        │  exact 58-feature schema the model was trained on
+        ▼
+   flow_outputs/*_filtered.csv     ← model-ready feature rows
+        │  loaded into memory by server.py
+        ▼
+   Transformer model (transformer_model.pth)
+        │  StandardScaler → forward pass → softmax
+        ▼
+   Live prediction + confidence + per-class probabilities
+        │
+        ▼
+   Flask SSE (/stream) → browser dashboard, updated every second
 ```
 
-**SSE (Server-Sent Events)** is the key mechanism. It's like a one-way WebSocket — the server pushes data to the browser over a long-lived HTTP connection. The browser never has to poll.
+Every stage is driven by files actually produced by `tshark`, `editcap`, and CICFlowMeter — there is no synthetic or estimated feature vector anywhere in this path anymore.
+
+---
+
+## 2. How the Frontend Works
+
+The frontend is a **single HTML page** (`templates/index.html`) served by Flask, unchanged in mechanism from before:
+
+```
+Browser  ──── GET /            ────────────────────▶  Flask returns index.html
+Browser  ──── GET /stream (SSE) ───────────────────▶  Flask streams JSON every 1 second
+```
+
+**SSE (Server-Sent Events)** is the transport. The server pushes a JSON snapshot of shared state to the browser once a second over a long-lived HTTP connection — no polling, no page refresh.
 
 ```
 server.py                        index.html (browser)
@@ -23,128 +60,138 @@ monitor_loop() runs every 1s     const es = new EventSource("/stream")
   → /stream yields JSON  ──────▶  update() rewrites DOM elements live
 ```
 
-No page refreshes. Everything updates in-place every second.
-
 ---
 
-## 2. How We're Using the Model
+## 3. How We're Using the Model Now
 
-The model is loaded **once at startup** and runs inference **every second** in the background thread.
+The model is loaded **once at startup** and runs inference **every second** in a background thread — but the input it receives has changed completely.
 
 ```
 startup:
-  model = TabularTransformer()          ← architecture defined in server.py
-  model.load_state_dict(transformer_model.pth)   ← your trained weights
-  scaler = pickle.load(scaler.pkl)      ← the StandardScaler from training
+  model  = TabularTransformer()                    ← architecture defined in server.py
+  model.load_state_dict(transformer_model.pth)     ← trained weights
+  scaler = pickle.load(scaler.pkl)                 ← StandardScaler from training
+
+background (spool_watch_loop + pcap_watch_loop):
+  1. Watch pcap_spool/ for new capture files, normalize with editcap
+  2. Watch pcap_inbox/ for normalized pcaps
+  3. Run CICFlowMeter on each pcap → *_Flow.csv (real flow features)
+  4. Run prepare_flows.py → *_filtered.csv (58 columns, model schema)
+  5. Load the filtered CSV into memory as `prepared_feature_df`
 
 every second (monitor_loop):
-  1. Read psutil network counters
-  2. build_feature_vector(...)  → list of 58 numbers
-  3. scaler.transform(feat)     → normalize (same transform as training data)
-  4. model(tensor)              → 6 logits
-  5. softmax(logits)            → 6 probabilities that sum to 100%
-  6. argmax                     → predicted class (0–5 → label name)
-  7. update state dict          → SSE pushes to browser
+  1. next_feature_vector() pulls the next row from prepared_feature_df
+     (falls back to a zero-vector only if no real flow data has been
+     processed yet — this is a genuine "no data yet" fallback, not a
+     substitute feature source)
+  2. scaler.transform(row)      → normalize with the training-time scaler
+  3. model(tensor)               → 6 logits
+  4. softmax(logits)             → 6 class probabilities
+  5. attack-override threshold   → if any attack class ≥ threshold%,
+                                    prefer it over a low-margin BENIGN call
+  6. update shared state         → SSE pushes it to the browser
 ```
 
-**The model never leaves the server.** The browser only ever sees the result (label + probabilities), not the raw inference.
+**Key change from before:** the feature vector is no longer built from `psutil` counters. It is a row of real CICFlowMeter output — actual flow duration, actual inter-arrival times, actual TCP flag counts, actual packet length statistics — computed from packets captured live on the wire.
+
+`psutil` is still used, but only for the dashboard's system-health and traffic-rate widgets (see below), and it no longer feeds the model at all.
 
 ---
 
-## 3. Are We Using JavaScript?
+## 4. Are We Using JavaScript?
 
-Yes — the frontend uses **vanilla JS only** (no React, no framework).
+Yes — vanilla JS only, no framework, no build step:
 
 | What | How |
 |------|-----|
 | **Chart.js** | Loaded from CDN — draws the live traffic line chart |
 | **EventSource API** | Built-in browser API — handles the SSE connection |
 | **DOM manipulation** | `document.getElementById(...).textContent = ...` — updates all numbers |
-| **CSS animations** | The pulsing dot, the glowing red badge on attack — pure CSS |
-
-No jQuery, no bundler, no npm. It's one `<script>` block at the bottom of the HTML.
+| **CSS animations** | The pulsing status dot, the glowing attack badge — pure CSS |
 
 ---
 
-## 4. What's Being Displayed and What It Means
+## 5. What's Being Displayed and What It Means
 
-### Stat Cards (top row)
+### Stat Cards (top row) — still system-level, for context
+
+These reflect the host's overall network activity and are **not** what the model sees; they give a human-readable sense of "is a lot of traffic happening right now."
 
 | Card | Source | What it means |
 |------|--------|---------------|
-| **Packets In/s** | `psutil.net_io_counters().packets_recv` delta per second | How many IP packets your machine received this second from ALL interfaces |
-| **Packets Out/s** | `packets_sent` delta | How many packets your machine sent |
-| **Bandwidth In (KB/s)** | `bytes_recv` delta / 1024 | Raw bytes received per second, converted to kilobytes |
-| **Bandwidth Out (KB/s)** | `bytes_sent` delta | Raw bytes sent per second |
-| **Connections** | `len(psutil.net_connections())` | Total open TCP/UDP sockets on your machine right now |
-| **Requests/s** | Flask `before_request` counter | How many HTTP requests hit **this Flask server** specifically in the last 1 second |
+| **Packets In/s** | `psutil.net_io_counters().packets_recv` delta per second | Packets received by the host this second, all interfaces |
+| **Packets Out/s** | `packets_sent` delta | Packets sent by the host |
+| **Bandwidth In (KB/s)** | `bytes_recv` delta / 1024 | Bytes received per second |
+| **Bandwidth Out (KB/s)** | `bytes_sent` delta | Bytes sent per second |
+| **Connections** | `len(psutil.net_connections())` | Open TCP/UDP sockets on the host right now |
+| **Requests/s** | Flask `before_request` counter | HTTP requests hitting this Flask server specifically, last 1 second |
 
 ### Live Traffic Chart (middle left)
 
-- X-axis: last 60 seconds (each point = 1 second)
-- Y-axis left: Packets/s (blue = in, purple = out)
-- Y-axis right: Bandwidth KB/s (green dashed)
-- Updates by shifting old values off the left and pushing new ones on the right
+- X-axis: last 60 seconds. Y-axis left: packets/s (in/out). Y-axis right: bandwidth KB/s.
+- Same host-level counters as the stat cards, plotted over time.
 
-### ML Detection Panel (middle right)
+### ML Detection Panel (middle right) — driven by real flow data
 
-- **Badge** turns green (🛡️ BENIGN) or red (💀 attack type) based on the model's top prediction
-- **Confidence** is the softmax probability of the top class
-- **Class Probabilities** — six bars, one per attack class, showing the model's uncertainty
-  - If it says BENIGN 52.8% — it's mostly sure but not 100%. This is expected with approximate features.
-  - If DDoS bar spikes to 90%+ during an attack → that's the model detecting something
+- **Badge**: green (🛡️ BENIGN) or red (💀 attack type), based on the model's prediction on the most recent real captured flow.
+- **Confidence**: softmax probability of the winning class, after the attack-override threshold is applied.
+- **Class Probabilities**: all six class scores, reflecting the model's view of the actual captured flow — not an estimate.
 
 ### Server Health (bottom left)
 
 | Gauge | Source |
 |-------|--------|
-| CPU | `psutil.cpu_percent()` — whole system CPU |
-| RAM | `psutil.virtual_memory().percent` — whole system RAM |
+| CPU | `psutil.cpu_percent()` — whole-system CPU |
+| RAM | `psutil.virtual_memory().percent` — whole-system RAM |
 
 ### Alert Log (bottom right)
 
-Every time the model predicts anything **other than BENIGN**, a timestamped entry is added. Stored in memory (last 50). Disappears on server restart.
+Every non-BENIGN prediction is appended with a timestamp. Kept in memory, last 50 entries, cleared on restart.
 
 ---
 
-## 5. How to Test if Network Statistics Are Proper
+## 6. Verifying the Capture Pipeline Is Actually Working
 
-Run these in a terminal and compare to what the dashboard shows:
+Rather than checking psutil counters against `nload`/`iftop` (which only proves system-level counting is correct), verify the **real capture chain**:
 
-```bash
-# Watch packets/bytes per second (like the dashboard does)
-watch -n 1 "cat /proc/net/dev | awk 'NR>2 {print \$1, \$3, \$11}'"
+```powershell
+# 1. Confirm tshark is capturing into the spool
+Get-ChildItem .\pcap_spool | Select-Object Name,Length,LastWriteTime
 
-# Or with nload (if installed)
-nload
+# 2. Confirm normalized files are reaching the inbox
+Get-ChildItem .\pcap_inbox | Select-Object Name,Length,LastWriteTime
 
-# Or with iftop
-sudo iftop
+# 3. Confirm CICFlowMeter is producing real flow CSVs
+Get-ChildItem .\flow_outputs | Select-Object Name,Length,LastWriteTime
 
-# Check active connections count
-ss -s   # or
-netstat -an | wc -l
+# 4. Confirm successfully processed captures
+Get-ChildItem .\pcap_done | Select-Object Name,Length,LastWriteTime
 
-# Test requests/s — curl this to see the counter tick up
-curl http://localhost:5000/api/ping
+# 5. Confirm nothing is silently failing
+Get-ChildItem .\pcap_error | Select-Object Name,Length,LastWriteTime
 ```
 
-> If you hammer `curl http://localhost:5000/api/ping` rapidly, you should see the **Requests/s** counter jump on the dashboard immediately.
+In the server console, watch for:
+
+- `Loaded prepared flow features from ... | rows=N` — real flow rows were loaded
+- `[INFER] source=prepared_flow row_idx=... pred=...` — inference is running on real flow data
+
+If you instead see `source=fallback_zero`, no real flow CSV has been loaded yet (e.g. capture pipeline hasn't produced output, or CICFlowMeter/editcap paths are misconfigured) — the model is temporarily receiving a zero-vector placeholder, not a "system approximation." This is a data-availability gap, not a design choice.
 
 ---
 
-## 6. Code Block-by-Block Explanation
+## 7. Code Block-by-Block (Current `server.py`)
 
-### Block 1 — Paths
+### Block 1 — Paths & Pipeline Config
 
 ```python
-MODEL_PATH  = os.path.join(BASE_DIR, "..", "transformer", "data", "transformer_model.pth")
-SCALER_PATH = os.path.join(BASE_DIR, "..", "transformer", "data", "scaler.pkl")
+MODEL_PATH  = .../transformer/data/transformer_model.pth
+SCALER_PATH = .../transformer/data/scaler.pkl
+PCAP_SPOOL_DIR, PCAP_INBOX_DIR, FLOW_OUTPUT_DIR, PCAP_DONE_DIR, PCAP_ERROR_DIR
+CICFLOW_WSL_BIN_DIR, CICFLOW_CMD_TEMPLATE, EDITCAP_EXE
 ```
 
-Navigates relative to `server.py` to find the trained model and scaler in the `transformer/data/` folder.
-
----
+All the folders and external-tool paths that drive the real capture-to-features pipeline. These are environment-variable overridable per machine (see `victim-dashboard/README.md`).
 
 ### Block 2 — Model Architecture
 
@@ -153,11 +200,9 @@ class FeatureTokenizer(nn.Module): ...
 class TabularTransformer(nn.Module): ...
 ```
 
-This is a **copy of the exact same architecture** your friend trained. The network structure must be identical — if even one layer is different, `load_state_dict()` will fail. The architecture defines the "shape" of the model; the `.pth` file fills in the learned weights.
+Unchanged: this must stay bit-for-bit identical to the architecture used in `train.py`, or `load_state_dict()` fails.
 
----
-
-### Block 3 — Model Loading
+### Block 3 — Model & Scaler Loading
 
 ```python
 model = TabularTransformer().to(device)
@@ -165,249 +210,141 @@ model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
 model.eval()
 ```
 
-- `TabularTransformer()` creates the empty model shell
-- `load_state_dict(...)` fills it with the trained weights from the `.pth` file
-- `model.eval()` turns off dropout and batch norm training mode — critical for inference
-
----
+Loads trained weights once at startup; `eval()` disables dropout/batchnorm training behavior for inference.
 
 ### Block 4 — Shared State Dict
 
 ```python
-state = {
-    "packets_in": 0.0, "label": "BENIGN", "alert_log": [], ...
-}
+state = { "packets_in": 0.0, ..., "label": "BENIGN", "alert_log": [], ... }
 state_lock = threading.Lock()
 ```
 
-This is the **single source of truth** shared between the background monitor thread and the Flask SSE endpoint. The lock (`threading.Lock`) prevents race conditions — only one thread can read/write at a time.
+Single source of truth shared between the capture/inference threads and the Flask SSE endpoint, protected by a lock.
 
----
+### Block 5 — Spool Watcher (`spool_watch_loop`)
 
-### Block 5 — Feature Vector Builder
+Watches `pcap_spool/` for files written by `tshark`, waits for them to stop growing (`SPOOL_SETTLE_SECONDS`), converts them to clean `.pcap` with `editcap`, and queues them into `pcap_inbox/`. Failed conversions move to `pcap_error/`.
 
-```python
-def build_feature_vector(pkt_in, pkt_out, bytes_in, bytes_out, conns, req_s, elapsed):
-```
+### Block 6 — PCAP Watcher (`pcap_watch_loop` → `process_pcap_file`)
 
-This is the **most important approximation in the system.** The model was trained on **CICIDS-2017 flow-level features** (58 very specific stats about individual TCP/UDP flows). But psutil only gives us system-wide counters.
+Watches `pcap_inbox/`, and for each file:
+1. Runs CICFlowMeter (`run_cicflowmeter`) → real per-flow CSV in `flow_outputs/`.
+2. Runs `prepare_flows.py` (`run_prepare_flows_script`) → 58-column filtered CSV matching the training schema.
+3. Loads the filtered CSV into `prepared_feature_df` (`load_prepared_feature_rows`).
+4. Moves the source pcap to `pcap_done/` (or `pcap_error/` on failure).
 
-So we **approximate**:
-- `flow_duration` = elapsed time in microseconds
-- `fwd_pkts` = packets sent, `bwd_pkts` = packets received
-- `fwd_pkt_mean` = bytes_out / packets_out (approximate average packet size)
-- `syn_flag` = estimated from requests/s (more requests → more SYNs)
-- IAT (Inter-Arrival Time) = flow_duration / packet_count (average gap between packets)
-- Everything else is derived from these or approximated to reasonable defaults
-
-> ⚠️ This is intentionally an approximation. It works well enough for a demo. Real production systems would use `scapy` or a dedicated flow exporter to compute exact CICIDS features from actual packet captures (see Q9).
-
----
-
-### Block 6 — Inference
+### Block 7 — Feature Row Selection (`next_feature_vector`)
 
 ```python
-def run_inference(feat_vec):
-    arr = np.array(feat_vec).reshape(1, -1)
-    arr = np.nan_to_num(arr, ...)     # sanitize: replace NaN/inf with safe values
-    arr = scaler.transform(arr)        # apply same normalization as training
-    tensor = torch.tensor(arr, ...)
-    with torch.no_grad():
-        logits = model(tensor)         # forward pass
-        probs  = torch.softmax(logits, dim=1).squeeze().numpy()
-    return LABEL_NAMES[argmax], confidence, probs
+def next_feature_vector():
+    if prepared_feature_df is None or empty:
+        return zeros(58), "fallback_zero", -1
+    row = prepared_feature_df.iloc[feature_row_index]
+    feature_row_index += 1
+    return row, "prepared_flow", current_idx
 ```
 
-`torch.no_grad()` disables gradient computation — makes inference ~2× faster and saves memory.
+Steps through real captured-flow rows in order, one per inference tick, wrapping around once exhausted. This is the direct replacement for the old psutil-based `build_feature_vector` approximation — the old function no longer exists in this codebase.
 
----
-
-### Block 7 — Monitor Loop
+### Block 8 — Inference (`run_inference`)
 
 ```python
-def monitor_loop():
-    prev_net = psutil.net_io_counters()
-    prev_time = time.time()
-    while True:
-        time.sleep(1)
-        curr_net = psutil.net_io_counters()
-        # compute deltas (diff from last second)
-        pkt_in = (curr_net.packets_recv - prev_net.packets_recv) / elapsed
-        ...
-        feat = build_feature_vector(...)
-        label, conf, probs = run_inference(feat)
-        with state_lock:
-            state[...] = ...   # update shared state
-        prev_net = curr_net    # slide the window
+arr    = scaler.transform(feat_vec)
+tensor = torch.tensor(arr)
+logits = model(tensor)
+probs  = softmax(logits)
 ```
 
-Runs as a **daemon thread** — dies automatically when the main Flask process exits. Uses a sliding window: always compares "now" vs "1 second ago" to get per-second rates.
+Same as before, but `feat_vec` now originates from real flow data, not synthetic system counters. An attack-override threshold (`ATTACK_OVERRIDE_THRESHOLD_PCT`) then picks the strongest non-benign class if it clears a configurable probability floor, biasing the demo toward flagging suspicious activity.
 
----
+### Block 9 — Monitor Loop (`monitor_loop`)
 
-### Block 8 — SSE Endpoint
+Runs every second: computes host-level psutil deltas for the dashboard's display cards, pulls the next real flow row via `next_feature_vector()`, runs inference, and writes both into `state` under `state_lock`. Non-BENIGN predictions are also appended to the alert log.
+
+### Block 10 — SSE Endpoint (`/stream`)
 
 ```python
 @app.route("/stream")
 def stream():
     def event_gen():
         while True:
-            with state_lock:
-                data = json.dumps(dict(state))
-            yield f"data: {data}\n\n"   # SSE format requires "data: ...\n\n"
+            data = json.dumps(dict(state))
+            yield f"data: {data}\n\n"
             time.sleep(1)
     return Response(event_gen(), mimetype="text/event-stream")
 ```
 
-Each browser tab that opens the dashboard opens its own `/stream` connection. Flask handles them in separate threads (because `threaded=True`). The `\n\n` at the end is required by the SSE protocol — the browser's `EventSource` won't fire `onmessage` without it.
+Streams the shared state to the browser once per second. Unchanged mechanism.
 
----
-
-### Block 9 — Request Counter
+### Block 11 — Request Counter
 
 ```python
 @app.before_request
 def count_request():
-    with _req_lock:
-        _req_window.append(time.time())
+    _req_window.append(time.time())
 ```
 
-`before_request` runs before **every** Flask route handler. Each request appends its timestamp to a `deque`. The monitor loop then counts how many entries are within the last 1 second — that's the requests/sec metric. Old entries are pruned automatically.
+Feeds the "Requests/s" stat card — purely a Flask-level HTTP counter, unrelated to model input.
 
 ---
 
-## 7. Roadmap: How You Could Attack This
+## 8. Generating Real Attack Traffic
 
-Here's where things get interesting. The dashboard detects attacks using the model — let's see how attacks would manifest:
+Because inference now runs on **actual captured packets**, running an attack tool against the victim's port and capturing it with `tshark` produces a **genuine flow** for CICFlowMeter to process — not a simulated feature vector.
 
-### Option A — HTTP Flood (simulates DDoS/DoS Hulk)
+### Option A — HTTP Flood (`traffic_attack.py`, included in this repo)
+```bash
+python traffic_attack.py --target http://<victim-ip>:5000 --workers 20 --duration 60
 ```
-Fire thousands of HTTP requests per second at /api/ping or /api/data
-Tools: wrk, ab (Apache Bench), hey, or a custom Python script
-```
-- `requests/s` spikes → `syn_flag` in feature vector spikes
-- `packets_in/out` spikes
-- Model should start predicting DDoS or DoS Hulk
+Hits `/`, `/api/ping`, `/api/data` concurrently from multiple worker threads. Produces real high-rate flows that CICFlowMeter will characterize with short IATs, high packet counts, and elevated SYN/ACK activity — the same signature the model was trained to recognize as DoS Hulk/DDoS-like traffic.
 
-### Option B — SYN Flood (TCP-level, simulates DDoS)
-```
-Send TCP SYN packets without completing the 3-way handshake
-Tools: hping3, scapy (requires sudo/root)
+### Option B — SYN Flood (simulates DDoS)
+```bash
 sudo hping3 -S --flood -p 5000 <victim-ip>
 ```
-- `connections` explodes (half-open connections pile up)
-- High SYN count → model detects DDoS
+Real half-open TCP connections, captured and turned into real flow features by CICFlowMeter.
 
 ### Option C — Slowloris (simulates DoS slowloris)
-```
-Open many connections, send partial HTTP headers very slowly
-Tools: slowhttptest, or the "slowloris" Python script
-```
-- High connection count with very low bandwidth
-- Specific pattern of long flow duration + few packets
+Long-lived, slow, partial-header connections — captured the same way, producing flows with long duration and low packet counts.
 
-### Option D — FTP Brute Force simulation (simulates FTP-Patator)
-```
-Rapid repeated login attempts to any service
-Tools: hydra, medusa, or a custom rapid-request script
-```
+### Option D — FTP/Login Brute Force (simulates FTP-Patator)
+Rapid repeated connection attempts, captured and processed identically.
 
-> The key insight: **the model was trained on what these attacks look like as network flows.** When your metrics start looking like those flows, the model should detect them.
+In every case, the workflow is the same: run the attack → `tshark` captures it into `pcap_spool/` → the pipeline turns it into real flow features → the model classifies the actual traffic that occurred.
 
 ---
 
-## 8. Making This Accessible to a Friend on a Different Network
+## 9. Exposing the Dashboard to a Remote Attacker Machine
 
-Since your friend is **not on the same LAN**, you need to expose port 5000 to the internet. Here are your options:
+Unchanged from before — three options depending on setup convenience vs. security:
 
-### Option A — ngrok (easiest, no firewall changes, recommended for demo)
-
-```bash
-# Install ngrok (free tier)
-curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc
-# Or just download from ngrok.com
-
-# Run alongside your Flask server
-ngrok http 5000
-```
-
-ngrok gives you a public URL like `https://abc123.ngrok.io` — your friend hits that and it tunnels to your local port 5000. **No firewall changes needed.** Free tier has a limit but is fine for demos.
-
-### Option B — Port Forwarding on your router
-
-1. Log into your router admin page (usually `192.168.1.1` or `192.168.0.1`)
-2. Find "Port Forwarding" or "NAT"
-3. Forward external port `5000` → your local machine's IP (`192.168.0.112`) port `5000`
-4. Find your public IP: `curl ifconfig.me`
-5. Give your friend: `http://<your-public-ip>:5000`
-6. **You may need to temporarily allow port 5000 in your firewall:**
-   ```bash
-   sudo ufw allow 5000/tcp
-   ```
-
-> ⚠️ Port forwarding exposes your machine to the open internet. Use it only for testing and disable it after.
-
-### Option C — Tailscale (VPN mesh, most secure)
-
-```bash
-# Both you and your friend install Tailscale (free)
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-
-# Tailscale gives both machines a private IP like 100.x.x.x
-# Your friend connects to http://100.x.x.x:5000 — fully encrypted
-```
-
-No firewall changes, no public exposure, works through NAT. Best for ongoing testing.
+- **ngrok** — `ngrok http 5000`, easiest for a demo, no firewall changes.
+- **Router port forwarding** — forward external port 5000 to the victim machine's LAN IP; requires a firewall rule (`sudo ufw allow 5000/tcp`) and exposes the machine publicly.
+- **Tailscale** — private mesh VPN, no public exposure, recommended for repeated testing.
 
 ---
 
-## 9. Are We Using Flows to Extract Features from Packets?
+## 10. Are We Using Real Flows to Extract Features from Packets?
 
-**Short answer: No. We're approximating.**
+**Yes.** This is the core change from the previous version of this document.
 
-Here's the honest breakdown:
+| Approach | Status |
+|----------|--------|
+| ~~psutil system-wide counters approximating flow stats~~ | **Removed** |
+| **CICFlowMeter computing real per-flow features from captured pcaps** | **Current implementation** |
 
-| Approach | What we're doing | What we should ideally do |
-|----------|-----------------|--------------------------|
-| **Current** | `psutil` system-wide counters (bytes/packets sent/received per second for the whole machine) | Per-flow feature extraction |
-| **Ideal** | Capture individual TCP/UDP flows and compute exact CICIDS features | ✅ |
+A flow = all packets between the same IP:port pair (one or both directions) within a timeout window. CICFlowMeter groups captured packets into flows and computes the exact CICIDS-2017-style feature set the model expects: Flow Duration, Inter-Arrival Times (mean/std/max/min, forward and backward), packet length statistics, TCP flag counts, header lengths, active/idle timing, and more — the full 58-column schema in `prepare_flows.py`'s `KEEP_COLUMNS`.
 
-**What a "flow" actually means in CICIDS context:**
-
-A flow = all packets between the same IP:port pair in one direction (or both), within a timeout window. Each flow gets features like:
-- How long did the flow last? (Flow Duration)
-- What's the average time between packets? (IAT = Inter-Arrival Time)
-- How big were the packets? (Packet Length Mean/Std)
-- Were there SYN/ACK/FIN flags? (Flag Counts)
-
-**To extract real CICIDS features from live traffic you'd need:**
+**Current pipeline in full:**
 
 ```
-Option 1: scapy (pure Python packet capture)
-  - sudo required
-  - sniff() captures raw packets
-  - You group by 5-tuple (src_ip, dst_ip, src_port, dst_port, protocol)
-  - Compute stats per flow per time window
-
-Option 2: CICFlowMeter (the actual tool used to generate CICIDS-2017)
-  - Java tool that processes pcap files or live interfaces
-  - Outputs exactly the right CSV format
-
-Option 3: pyshark / tshark (Wireshark's CLI)
-  - sudo required
-  - Good for offline pcap analysis
+tshark  → raw packets on disk (pcap_spool/)
+editcap → normalized pcap (pcap_inbox/)
+CICFlowMeter → real flow statistics (flow_outputs/*_Flow.csv)
+prepare_flows.py → reordered/renamed to the training schema (*_filtered.csv)
+model → real prediction on real traffic
 ```
 
-**Why we didn't do this for the demo:**
+`prepare_flows.py` also handles schema drift between CICFlowMeter versions (its `KNOWN_MAPPINGS` and fuzzy column matching via `get_close_matches`), so minor naming differences in CICFlowMeter's output don't break the feature alignment — but the underlying values are always computed from actual packets, never estimated.
 
-1. `scapy` requires `sudo` — Flask servers shouldn't run as root
-2. Real flow extraction needs a 5-60 second window to compute IAT stats properly — makes the demo sluggish
-3. psutil approximation is good enough to demonstrate the concept
-
-**The demo still works because:**
-- When traffic spikes (DDoS), psutil metrics spike too
-- The approximate feature vector shifts toward attack distributions
-- The model picks up on those shifts
-
-If you wanted production accuracy, you'd run `scapy` as a separate root process, pipe flow features into the Flask server via a queue, and feed those to the model instead.
+**Why this matters for accuracy:** the model was trained on CICIDS-2017 flow features. Feeding it real flow features computed the same way (rather than a system-level approximation) means the input distribution at inference time actually matches what the model learned from — closing the gap that the old psutil-based approach openly acknowledged as a limitation.
