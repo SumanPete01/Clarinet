@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Clarinet — Victim Server Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:        #080c14;
+      --surface:   #0d1220;
+      --surface2:  #131929;
+      --border:    #1e2d47;
+      --accent:    #3b82f6;
+      --accent2:   #6366f1;
+      --green:     #10b981;
+      --red:       #ef4444;
+      --orange:    #f97316;
+      --amber:     #f59e0b;
+      --purple:    #8b5cf6;
+      --text:      #e2e8f0;
+      --muted:     #64748b;
+      --glow-g:    rgba(16,185,129,.15);
+      --glow-r:    rgba(239,68,68,.15);
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    /* ── Animated background ── */
+    body::before {
+      content: '';
+      position: fixed; inset: 0; z-index: 0;
+      background:
+        radial-gradient(ellipse 80% 60% at 10% 20%, rgba(59,130,246,.06) 0%, transparent 60%),
+        radial-gradient(ellipse 60% 50% at 90% 80%, rgba(99,102,241,.05) 0%, transparent 60%);
+      pointer-events: none;
+    }
+
+    /* ── Header ── */
+    header {
+      position: sticky; top: 0; z-index: 100;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 2rem;
+      height: 60px;
+      background: rgba(8,12,20,.85);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+    }
+    .logo {
+      display: flex; align-items: center; gap: .6rem;
+      font-size: 1.1rem; font-weight: 700; letter-spacing: .04em;
+      color: var(--text);
+    }
+    .logo svg { color: var(--accent); }
+    .logo span { color: var(--accent); }
+
+    .header-right { display: flex; align-items: center; gap: 1.5rem; }
+    .uptime-display { font-family: 'JetBrains Mono', monospace; font-size: .8rem; color: var(--muted); }
+
+    /* Status pill */
+    .status-pill {
+      display: flex; align-items: center; gap: .45rem;
+      padding: .3rem .9rem;
+      border-radius: 9999px;
+      font-size: .78rem; font-weight: 600; letter-spacing: .04em;
+      border: 1px solid transparent;
+      transition: all .4s ease;
+    }
+    .status-pill.safe   { background: rgba(16,185,129,.12); border-color: rgba(16,185,129,.3); color: var(--green); }
+    .status-pill.attack { background: rgba(239,68,68,.12);  border-color: rgba(239,68,68,.3);  color: var(--red);   }
+    .pulse {
+      width: 8px; height: 8px; border-radius: 50%;
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+    .safe   .pulse { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .attack .pulse { background: var(--red);   box-shadow: 0 0 6px var(--red);   }
+    @keyframes pulse {
+      0%,100% { opacity:1; transform:scale(1); }
+      50%      { opacity:.5; transform:scale(1.4); }
+    }
+
+    /* ── Main layout ── */
+    main {
+      position: relative; z-index: 1;
+      max-width: 1400px; margin: 0 auto;
+      padding: 1.5rem 2rem 3rem;
+      display: flex; flex-direction: column; gap: 1.5rem;
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 1.25rem 1.5rem;
+      transition: border-color .3s;
+    }
+    .card:hover { border-color: rgba(59,130,246,.3); }
+    .card-title {
+      font-size: .7rem; font-weight: 600; letter-spacing: .1em;
+      text-transform: uppercase; color: var(--muted);
+      margin-bottom: 1rem;
+    }
+
+    /* ── Stat grid (top row) ── */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 1rem;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.1rem 1.25rem;
+      display: flex; flex-direction: column; gap: .4rem;
+      transition: all .3s;
+    }
+    .stat-card:hover { border-color: rgba(59,130,246,.3); transform: translateY(-2px); }
+    .stat-icon {
+      width: 34px; height: 34px; border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1rem; margin-bottom: .2rem;
+    }
+    .stat-label { font-size: .72rem; color: var(--muted); font-weight: 500; }
+    .stat-value {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.45rem; font-weight: 600; color: var(--text);
+      letter-spacing: -.02em;
+    }
+    .stat-sub { font-size: .7rem; color: var(--muted); }
+
+    /* ── Middle: chart + detection ── */
+    .mid-row { display: grid; grid-template-columns: 1fr 340px; gap: 1.5rem; }
+    @media (max-width: 900px) { .mid-row { grid-template-columns: 1fr; } }
+
+    /* Chart */
+    .chart-wrap { position: relative; height: 240px; }
+
+    /* Detection card */
+    .detect-card {
+      display: flex; flex-direction: column; gap: 1rem;
+    }
+    .detect-badge {
+      display: flex; flex-direction: column; align-items: center;
+      justify-content: center; gap: .4rem;
+      padding: 1.25rem;
+      border-radius: 12px;
+      border: 1px solid;
+      transition: all .4s ease;
+      text-align: center;
+    }
+    .detect-badge.safe   {
+      background: var(--glow-g);
+      border-color: rgba(16,185,129,.35);
+    }
+    .detect-badge.attack {
+      background: var(--glow-r);
+      border-color: rgba(239,68,68,.4);
+      animation: threat-pulse 2s ease-in-out infinite;
+    }
+    @keyframes threat-pulse {
+      0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.0); }
+      50%      { box-shadow: 0 0 20px 4px rgba(239,68,68,.2); }
+    }
+    .detect-label { font-size: 1rem; font-weight: 700; letter-spacing: .06em; }
+    .detect-conf  { font-size: .75rem; color: var(--muted); }
+
+    .prob-bars { display: flex; flex-direction: column; gap: .5rem; }
+    .prob-row { display: flex; flex-direction: column; gap: .2rem; }
+    .prob-meta { display: flex; justify-content: space-between; font-size: .7rem; }
+    .prob-name { color: var(--muted); }
+    .prob-pct  { font-family: 'JetBrains Mono', monospace; color: var(--text); }
+    .prob-bar-bg {
+      height: 5px; border-radius: 9999px;
+      background: var(--surface2);
+      overflow: hidden;
+    }
+    .prob-bar-fill {
+      height: 100%; border-radius: 9999px;
+      transition: width .6s cubic-bezier(.4,0,.2,1);
+    }
+
+    /* ── Bottom: health + log ── */
+    .bot-row { display: grid; grid-template-columns: 200px 1fr; gap: 1.5rem; }
+    @media (max-width: 900px) { .bot-row { grid-template-columns: 1fr; } }
+
+    /* Health gauges */
+    .health-gauges { display: flex; flex-direction: column; gap: 1rem; }
+    .gauge-row { display: flex; flex-direction: column; gap: .3rem; }
+    .gauge-meta { display: flex; justify-content: space-between; font-size: .75rem; }
+    .gauge-bar-bg {
+      height: 6px; border-radius: 9999px;
+      background: var(--surface2); overflow: hidden;
+    }
+    .gauge-bar-fill {
+      height: 100%; border-radius: 9999px;
+      transition: width .6s cubic-bezier(.4,0,.2,1);
+    }
+    .cpu-fill  { background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+    .ram-fill  { background: linear-gradient(90deg, var(--green), var(--accent)); }
+
+    /* Alert log */
+    .alert-log { overflow: hidden; }
+    .log-list {
+      display: flex; flex-direction: column; gap: .5rem;
+      max-height: 200px; overflow-y: auto;
+    }
+    .log-list::-webkit-scrollbar { width: 4px; }
+    .log-list::-webkit-scrollbar-track { background: transparent; }
+    .log-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 9999px; }
+
+    .log-item {
+      display: flex; align-items: center; gap: .75rem;
+      padding: .5rem .75rem;
+      background: var(--surface2);
+      border-radius: 8px;
+      border-left: 3px solid;
+      font-size: .76rem;
+      animation: slide-in .3s ease;
+    }
+    @keyframes slide-in {
+      from { opacity:0; transform: translateX(-8px); }
+      to   { opacity:1; transform: translateX(0); }
+    }
+    .log-time { font-family: 'JetBrains Mono', monospace; color: var(--muted); white-space: nowrap; }
+    .log-label { font-weight: 600; }
+    .log-conf  { color: var(--muted); margin-left: auto; white-space: nowrap; }
+
+    .no-alerts { color: var(--muted); font-size: .8rem; text-align: center; padding: 1rem; }
+
+    /* ── Responsive tweaks ── */
+    @media (max-width: 600px) { main { padding: 1rem; } }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<header>
+  <div class="logo">
+    <svg width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round" viewBox="0 0 24 24">
+      <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+      <path d="M2 17l10 5 10-5"/>
+      <path d="M2 12l10 5 10-5"/>
+    </svg>
+    Clarinet<span> / Victim</span>
+  </div>
+
+  <div class="header-right">
+    <span class="uptime-display">Uptime: <span id="uptime">00:00:00</span></span>
+    <div class="status-pill safe" id="status-pill">
+      <div class="pulse"></div>
+      <span id="status-text">SYSTEM SAFE</span>
+    </div>
+  </div>
+</header>
+
+<!-- ── Main ── -->
+<main>
+
+  <!-- stat cards -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-icon" style="background:rgba(59,130,246,.12)">📥</div>
+      <div class="stat-label">Packets In / s</div>
+      <div class="stat-value" id="s-pkt-in">0</div>
+      <div class="stat-sub">inbound</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:rgba(99,102,241,.12)">📤</div>
+      <div class="stat-label">Packets Out / s</div>
+      <div class="stat-value" id="s-pkt-out">0</div>
+      <div class="stat-sub">outbound</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:rgba(16,185,129,.12)">⬇️</div>
+      <div class="stat-label">Bandwidth In</div>
+      <div class="stat-value" id="s-bw-in">0</div>
+      <div class="stat-sub">KB / s</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:rgba(245,158,11,.12)">⬆️</div>
+      <div class="stat-label">Bandwidth Out</div>
+      <div class="stat-value" id="s-bw-out">0</div>
+      <div class="stat-sub">KB / s</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:rgba(139,92,246,.12)">🔗</div>
+      <div class="stat-label">Connections</div>
+      <div class="stat-value" id="s-conns">0</div>
+      <div class="stat-sub">active sockets</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background:rgba(239,68,68,.12)">⚡</div>
+      <div class="stat-label">Requests / s</div>
+      <div class="stat-value" id="s-rps">0</div>
+      <div class="stat-sub">HTTP hits</div>
+    </div>
+  </div>
+
+  <!-- chart + detection -->
+  <div class="mid-row">
+    <div class="card">
+      <div class="card-title">Live Traffic</div>
+      <div class="chart-wrap">
+        <canvas id="traffic-chart"></canvas>
+      </div>
+    </div>
+
+    <div class="card detect-card">
+      <div class="card-title">ML Detection</div>
+
+      <div class="detect-badge safe" id="detect-badge">
+        <div style="font-size:2rem" id="detect-icon">🛡️</div>
+        <div class="detect-label" id="detect-label">BENIGN</div>
+        <div class="detect-conf" id="detect-conf">Confidence: 100%</div>
+      </div>
+
+      <div>
+        <div class="card-title" style="margin-bottom:.6rem">Class Probabilities</div>
+        <div class="prob-bars" id="prob-bars"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- health + log -->
+  <div class="bot-row">
+    <div class="card">
+      <div class="card-title">Server Health</div>
+      <div class="health-gauges">
+        <div class="gauge-row">
+          <div class="gauge-meta">
+            <span style="font-size:.75rem;color:var(--muted)">CPU</span>
+            <span style="font-size:.75rem;font-family:'JetBrains Mono'" id="cpu-val">0%</span>
+          </div>
+          <div class="gauge-bar-bg">
+            <div class="gauge-bar-fill cpu-fill" id="cpu-bar" style="width:0%"></div>
+          </div>
+        </div>
+        <div class="gauge-row">
+          <div class="gauge-meta">
+            <span style="font-size:.75rem;color:var(--muted)">RAM</span>
+            <span style="font-size:.75rem;font-family:'JetBrains Mono'" id="ram-val">0%</span>
+          </div>
+          <div class="gauge-bar-bg">
+            <div class="gauge-bar-fill ram-fill" id="ram-bar" style="width:0%"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card alert-log">
+      <div class="card-title">Alert Log</div>
+      <div class="log-list" id="log-list">
+        <div class="no-alerts" id="no-alerts">No alerts yet — system is clean ✅</div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+  // ── Label colours ──────────────────────────────────────────────────────────
+  const LABEL_COLORS = {
+    "BENIGN":        "#10b981",
+    "DoS":           "#f97316",
+  };
+  const LABEL_ICONS = {
+    "BENIGN":        "🛡️",
+    "DoS":           "🔥",
+  };
+  const LABELS = ["BENIGN","DoS"];
+
+  // ── Traffic chart ──────────────────────────────────────────────────────────
+  const MAX_POINTS = 60;
+  const labels     = Array.from({length: MAX_POINTS}, () => "");
+  const pktsInData = new Array(MAX_POINTS).fill(0);
+  const pktsOutData= new Array(MAX_POINTS).fill(0);
+  const bwInData   = new Array(MAX_POINTS).fill(0);
+
+  const ctx = document.getElementById("traffic-chart").getContext("2d");
+  const chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Packets In",
+          data: pktsInData,
+          borderColor: "#3b82f6",
+          backgroundColor: "rgba(59,130,246,.08)",
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.4,
+          fill: true,
+        },
+        {
+          label: "Packets Out",
+          data: pktsOutData,
+          borderColor: "#6366f1",
+          backgroundColor: "rgba(99,102,241,.06)",
+          borderWidth: 2,
+          pointRadius: 0,
+          tension: 0.4,
+          fill: true,
+        },
+        {
+          label: "BW In (KB/s)",
+          data: bwInData,
+          borderColor: "#10b981",
+          backgroundColor: "rgba(16,185,129,.06)",
+          borderWidth: 1.5,
+          borderDash: [4,3],
+          pointRadius: 0,
+          tension: 0.4,
+          fill: false,
+          yAxisID: "bw",
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 300 },
+      interaction: { mode: "index", intersect: false },
+      scales: {
+        x: { display: false },
+        y: {
+          grid: { color: "rgba(255,255,255,.04)" },
+          ticks: { color: "#64748b", font: { family: "'JetBrains Mono'", size: 10 } },
+          title: { display: true, text: "Packets/s", color: "#64748b", font: { size: 10 } },
+        },
+        bw: {
+          position: "right",
+          grid: { drawOnChartArea: false },
+          ticks: { color: "#64748b", font: { family: "'JetBrains Mono'", size: 10 } },
+          title: { display: true, text: "KB/s", color: "#64748b", font: { size: 10 } },
+        },
+      },
+      plugins: {
+        legend: {
+          labels: { color: "#64748b", font: { size: 11 }, boxWidth: 10, padding: 12 }
+        },
+        tooltip: {
+          backgroundColor: "#0d1220",
+          borderColor: "#1e2d47",
+          borderWidth: 1,
+          titleColor: "#e2e8f0",
+          bodyColor: "#94a3b8",
+        },
+      },
+    },
+  });
+
+  // ── Probability bars init ─────────────────────────────────────────────────
+  const probBarsEl = document.getElementById("prob-bars");
+  LABELS.forEach(lbl => {
+    const color = LABEL_COLORS[lbl];
+    probBarsEl.innerHTML += `
+      <div class="prob-row" id="prob-row-${lbl.replace(/\s/g,'_')}">
+        <div class="prob-meta">
+          <span class="prob-name">${lbl}</span>
+          <span class="prob-pct" id="pct-${lbl.replace(/\s/g,'_')}">0%</span>
+        </div>
+        <div class="prob-bar-bg">
+          <div class="prob-bar-fill" id="bar-${lbl.replace(/\s/g,'_')}"
+               style="width:0%;background:${color}66;border-right:2px solid ${color}"></div>
+        </div>
+      </div>`;
+  });
+
+  // ── Uptime formatter ───────────────────────────────────────────────────────
+  function fmtUptime(s) {
+    const h = String(Math.floor(s/3600)).padStart(2,"0");
+    const m = String(Math.floor((s%3600)/60)).padStart(2,"0");
+    const ss= String(s%60).padStart(2,"0");
+    return `${h}:${m}:${ss}`;
+  }
+
+  // ── Update UI ─────────────────────────────────────────────────────────────
+  let prevAlertCount = 0;
+
+  function update(data) {
+    // Stat cards
+    document.getElementById("s-pkt-in").textContent  = data.packets_in;
+    document.getElementById("s-pkt-out").textContent = data.packets_out;
+    document.getElementById("s-bw-in").textContent   = data.bytes_in;
+    document.getElementById("s-bw-out").textContent  = data.bytes_out;
+    document.getElementById("s-conns").textContent   = data.connections;
+    document.getElementById("s-rps").textContent     = data.requests_sec;
+    document.getElementById("uptime").textContent    = fmtUptime(data.uptime);
+
+    // Chart
+    pktsInData.shift();  pktsInData.push(data.packets_in);
+    pktsOutData.shift(); pktsOutData.push(data.packets_out);
+    bwInData.shift();    bwInData.push(data.bytes_in);
+    chart.update("none");
+
+    // Detection badge
+    const label  = data.label;
+    const isSafe = label === "BENIGN";
+    const color  = LABEL_COLORS[label] || "#3b82f6";
+    const badge  = document.getElementById("detect-badge");
+    const pill   = document.getElementById("status-pill");
+    const stText = document.getElementById("status-text");
+
+    badge.className = `detect-badge ${isSafe ? "safe" : "attack"}`;
+    document.getElementById("detect-icon").textContent  = LABEL_ICONS[label] || "🛡️";
+    document.getElementById("detect-label").textContent = label;
+    document.getElementById("detect-label").style.color = color;
+    document.getElementById("detect-conf").textContent  = `Confidence: ${data.confidence}%`;
+
+    pill.className = `status-pill ${isSafe ? "safe" : "attack"}`;
+    stText.textContent = isSafe ? "SYSTEM SAFE" : `UNDER ATTACK`;
+
+    // Prob bars
+    const displayProbs = {
+      BENIGN: data.probabilities[0] ?? 0,
+      DoS:    (data.probabilities[1] ?? 0)
+            + (data.probabilities[2] ?? 0)
+            + (data.probabilities[3] ?? 0)
+            + (data.probabilities[4] ?? 0)
+            + (data.probabilities[5] ?? 0),
+    };
+
+    LABELS.forEach(lbl => {
+      const key = lbl.replace(/\s/g,"_");
+      const pctEl = document.getElementById(`pct-${key}`);
+      const barEl = document.getElementById(`bar-${key}`);
+      const p = displayProbs[lbl] ?? 0;
+      if (pctEl) pctEl.textContent = `${p.toFixed(1)}%`;
+      if (barEl) barEl.style.width = `${Math.min(p,100)}%`;
+    });
+
+    // Health
+    document.getElementById("cpu-val").textContent = `${data.cpu}%`;
+    document.getElementById("ram-val").textContent = `${data.ram}%`;
+    document.getElementById("cpu-bar").style.width = `${data.cpu}%`;
+    document.getElementById("ram-bar").style.width = `${data.ram}%`;
+
+    // Alert log
+    const log = data.alert_log || [];
+    const list = document.getElementById("log-list");
+    const noAlert = document.getElementById("no-alerts");
+    if (log.length > 0) {
+      if (noAlert) noAlert.remove();
+      if (log.length !== prevAlertCount) {
+        list.innerHTML = log.map(e => {
+          const c = LABEL_COLORS[e.label] || "#3b82f6";
+          return `<div class="log-item" style="border-left-color:${c}">
+            <span class="log-time">${e.time}</span>
+            <span class="log-label" style="color:${c}">${e.label}</span>
+            <span class="log-conf">${e.confidence}%</span>
+          </div>`;
+        }).join("");
+        prevAlertCount = log.length;
+      }
+    }
+  }
+
+  // ── SSE connection ─────────────────────────────────────────────────────────
+  function connect() {
+    const es = new EventSource("/stream");
+    es.onmessage = e => { try { update(JSON.parse(e.data)); } catch(_){} };
+    es.onerror   = () => { es.close(); setTimeout(connect, 2000); };
+  }
+  connect();
+</script>
+</body>
+</html>
