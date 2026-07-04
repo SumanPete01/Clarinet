@@ -1,4 +1,4 @@
-# Clarinet — Victim Dashboard: Full System Explainer (Updated)
+# Clarinet — Victim Dashboard: Full System Explainer
 
 > **This document supersedes the old version.** The system previously ran inference on *approximated* features built from `psutil` system counters (packets/sec, bytes/sec, etc. treated as stand-ins for flow statistics). That approximation layer (`build_feature_vector`) has been **removed**. The system now captures **real packets off the wire**, reconstructs **real network flows** with CICFlowMeter, and runs the transformer on the **real 58 CICIDS-style features** computed from that traffic. What follows describes the system as it actually works today.
 
@@ -133,7 +133,7 @@ These reflect the host's overall network activity and are **not** what the model
 
 ### ML Detection Panel (middle right) — driven by real flow data
 
-- **Badge**: green (🛡️ BENIGN) or red (💀 attack type), based on the model's prediction on the most recent real captured flow.
+- **Badge**: green (BENIGN) or red (attack type), based on the model's prediction on the most recent real captured flow.
 - **Confidence**: softmax probability of the winning class, after the attack-override threshold is applied.
 - **Class Probabilities**: all six class scores, reflecting the model's view of the actual captured flow — not an estimate.
 
