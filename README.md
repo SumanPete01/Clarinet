@@ -1,158 +1,154 @@
-# Commit Guide
+# Clarinet — Transformer-Based Network Intrusion Detection System
 
-All team members must follow this guide to maintain a clean, readable, and organized commit history.
+Clarinet is a real-time intrusion detection pipeline that captures live network packets, converts them into flow-level statistical features, and classifies them with a custom Transformer model — all rendered on a live monitoring dashboard.
 
----
-
-## 1. Clone the Repository
-Each team member must begin by cloning the central repository to their local system.
-
-- Do **not** work directly on the remote repository.
-- All changes should be made locally first.
+Unlike typical academic IDS demos that replay static CSV datasets through a model, Clarinet performs **live packet capture → flow reconstruction → feature extraction → transformer inference**, end to end, on real traffic.
 
 ---
 
-## 2. Create Your Own Branch
-After cloning the repository:
+## What This Project Does
 
-- Create a **personal branch** from the `master` branch.
-- Each team member must work **only on their own branch**.
-- There are four members in the group, so there will be four separate branches.
-
-> ⚠️ **Important:**
-> No one should push directly to the `master` branch under any circumstances.
+1. Captures live traffic on a target ("victim") machine using `tshark`.
+2. Converts captures into proper `.pcap` files and extracts **58 CICIDS-2017-style flow features** per network flow using **CICFlowMeter**.
+3. Feeds those features into a **Transformer encoder** trained to classify each flow as **BENIGN** or one of five attack types.
+4. Streams live predictions, traffic stats, and system health to a browser dashboard in real time over Server-Sent Events (SSE).
+5. Includes an in-repo traffic generator to simulate attack load (e.g. HTTP flood) for demonstration and testing.
 
 ---
 
-## 3. Work Only on Your Branch
-- All development, edits, and updates must be done on your personal branch.
-- Pull the latest changes from `master` periodically to stay up to date.
-- Resolve conflicts within your branch if needed.
+## Architecture
+
+```
+┌──────────────┐     tshark capture      ┌───────────────┐
+│  Live Network │ ───────────────────────▶│  pcap_spool/  │
+│   Traffic     │                         └───────┬───────┘
+└──────────────┘                                  │ editcap (normalize)
+                                                   ▼
+                                           ┌───────────────┐
+                                           │ pcap_inbox/   │
+                                           └───────┬───────┘
+                                                   │ CICFlowMeter
+                                                   ▼
+                                           ┌───────────────┐
+                                           │ flow_outputs/ │ (*_Flow.csv)
+                                           └───────┬───────┘
+                                                   │ prepare_flows.py
+                                                   ▼
+                                       58-feature filtered CSV row
+                                                   │
+                                                   ▼
+                                   ┌───────────────────────────────┐
+                                   │   Tabular Transformer Model    │
+                                   │  (PyTorch, trained offline)    │
+                                   └───────────────┬────────────────┘
+                                                   │ prediction + confidence
+                                                   ▼
+                                   ┌───────────────────────────────┐
+                                   │  Flask server (SSE) + Dashboard│
+                                   └───────────────────────────────┘
+```
+
+Processed and failed captures are moved into `pcap_done/` and `pcap_error/` respectively for traceability.
 
 ---
 
-## 4. Making Commits
-When committing changes:
+## Model
 
-- Commit **small and meaningful changes** rather than large unrelated updates.
-- Make commits **frequently** to track progress clearly.
-- Avoid committing broken or incomplete work unless necessary.
+The classifier (`transformer/`) is a custom **Tabular Transformer** built from scratch in PyTorch:
 
----
+- **Feature Tokenizer** — projects each of the 58 numeric flow features into a learned embedding space and adds a per-feature positional embedding, turning a flat feature vector into a sequence of tokens.
+- **Transformer Encoder** — 2 encoder layers, 4 attention heads, `d_model=64`, applied over the tokenized features with a prepended `[CLS]` token (same pattern as ViT/BERT-style classification).
+- **Classification Head** — LayerNorm → Linear → ReLU → Dropout → Linear, producing logits over 6 classes.
 
-## 5. Commit Message Guidelines
-Commit messages should be:
-- **Descriptive** – clearly explain what was changed
-- **Readable** – easy for others to understand
-- **Concise** – short but informative
+**Classes:** `BENIGN`, `DDoS`, `DoS GoldenEye`, `DoS Hulk`, `DoS slowloris`, `FTP-Patator`
 
-### Good Commit Message Examples
-- `Add initial data preprocessing pipeline`
-- `Update README with project overview`
-- `Fix incorrect attack label mapping`
-- `Improve explanation text clarity`
-
-### Bad Commit Message Examples
-- `update`
-- `changes`
-- `final`
-- `stuff`
+Trained on an undersampled, class-balanced subset of CICIDS-2017-style flow data (`train.py`), using `StandardScaler`-normalized features, `AdamW`, and cross-entropy loss. The trained weights (`transformer_model.pth`) and fitted scaler (`scaler.pkl`) are loaded by the live server at startup and never retrained on live traffic.
 
 ---
 
-## 6. Pushing Changes
-- Push commits **only to your personal branch**
-- Never push directly to `master`
-- Ensure your branch is stable before pushing
+## Live Dashboard
+
+The `victim-dashboard/` Flask app is the "victim" machine's monitoring console:
+
+- **Live traffic chart** — packets/sec and bandwidth in/out, updated every second.
+- **ML detection panel** — current predicted class with confidence, plus a live probability breakdown across all 6 classes.
+- **System health** — CPU and RAM usage of the monitored host.
+- **Alert log** — a running, timestamped history of every non-benign prediction.
+- **Attack-override logic** — if any attack class crosses a configurable confidence threshold, it's surfaced even when BENIGN still holds the raw top softmax score, favoring recall on suspicious flows.
+
+The frontend is a single server-rendered page using vanilla JavaScript, Chart.js, and the native `EventSource` API for SSE — no frontend framework or build step.
 
 ---
 
-## 7. Keeping Commit History Clean
-To maintain a clean repository:
-- Avoid unnecessary commits
-- Do not commit temporary or experimental files
-- Write clear commit messages
-- Keep commits logically separated
+## Repository Layout
 
-A clean commit history helps everyone understand the project evolution and simplifies collaboration.
-
----
-
-## 8. Merging to Master
-- Merging into `master` will be done **only after team discussion**
-- Merges should be reviewed and approved by the team
-- No direct commits to `master` are allowed
-
----
-
-## Summary
-- Clone the repository
-- Create your own branch from `master`
-- Work and commit only on your branch
-- Write clear and descriptive commit messages
-- Push only to your branch
-- Keep the commit history clean and organized
-
-Following this guide ensures smooth collaboration and project stability.
+```
+Clarinet/
+├── transformer/
+│   ├── data/
+│   │   ├── transformer_model.pth   # trained model weights
+│   │   └── scaler.pkl              # fitted StandardScaler
+│   ├── notebooks/
+│   │   └── transformer_architecture.ipynb
+│   └── scripts/
+│       └── train.py                # model training + evaluation
+│
+├── victim-dashboard/
+│   ├── server.py                   # Flask app: capture pipeline + inference + SSE
+│   ├── prepare_flows.py            # maps raw CICFlow CSV → the 58 model features
+│   ├── traffic_attack.py           # lab-only HTTP load generator for demos
+│   ├── reset_pipeline.py           # clears spool/inbox/output folders
+│   ├── templates/                  # dashboard frontend
+│   └── README.md                   # detailed pipeline setup guide (per-machine config)
+│
+└── requirements.txt
+```
 
 ---
 
-## Overview of Clarinet
-This project presents an AI-driven system designed to identify different types of cyberattacks from network traffic data and explain its decisions in clear, human-readable language. The system combines network traffic analysis with explainable artificial intelligence to improve transparency and usability in cybersecurity monitoring environments such as Security Operations Centers (SOCs).
+## Running It
+
+Full setup (tshark interface index, CICFlowMeter install/config for WSL or native Windows, environment variables, and troubleshooting) is documented in [`victim-dashboard/README.md`](./victim-dashboard/README.md). At a high level:
+
+**Terminal 1 — start the server (pipeline + dashboard + inference):**
+```powershell
+cd victim-dashboard
+python server.py
+```
+
+**Terminal 2 — capture live traffic into the spool:**
+```powershell
+tshark -i <interface_index> -f "tcp port 5000" -b duration:15 -b files:200 -w victim-dashboard\pcap_spool\cap.pcap
+```
+
+Then open `http://localhost:5000` to watch live classification. Optionally simulate attack traffic from another terminal:
+```powershell
+python victim-dashboard/traffic_attack.py --target http://<victim-ip>:5000 --workers 20 --duration 60
+```
 
 ---
 
-## Dataset Handling
-The system uses publicly available intrusion detection datasets such as **CICIDS2017** and **NSL-KDD**, which contain real-world network traffic labeled as normal or malicious activity.
+## Tech Stack
 
-### How the Data Is Handled
-- Raw network traffic records are collected from dataset files.
-- Incomplete, duplicate, or inconsistent records are removed to maintain data quality.
-- Network traffic attributes are standardized into a uniform structure.
-- Traffic samples are grouped into predefined categories such as **Normal**, **DoS**, **DDoS**, **Port Scan**, and **Probe**.
-- Processed data is stored in a reusable format to ensure reproducibility across experiments.
-
-This approach ensures that the learning system is trained on clean, balanced, and representative network traffic data.
-
----
-
-## System Implementation Flow
-The project follows a structured, multi-stage pipeline:
-
-1. **Input Stage**
-   Network traffic data is provided to the system in a structured file format.
-
-2. **Preprocessing Stage**
-   The input data is cleaned, normalized, and prepared for analysis.
-
-3. **Threat Classification Stage**
-   The system analyzes the processed data and classifies the traffic as normal or malicious, assigning an appropriate attack category when applicable.
-
-4. **Explanation Generation Stage**
-   For each prediction, the system identifies influential traffic characteristics and converts them into concise natural language explanations.
-
-5. **Output Stage**
-   The final output includes:
-   - The predicted traffic category
-   - A human-readable explanation describing the reasoning behind the prediction
+| Layer | Technology |
+|---|---|
+| Model | PyTorch (custom Transformer encoder) |
+| Feature extraction | CICFlowMeter, `tshark` / `editcap` |
+| Backend | Flask, Flask-CORS, Server-Sent Events |
+| Data processing | pandas, NumPy, scikit-learn |
+| Frontend | Vanilla JS, Chart.js, HTML/CSS |
+| System monitoring | psutil |
 
 ---
 
-## Explainability Focus
-Instead of producing only a classification label, the system emphasizes interpretability:
-- Key traffic patterns influencing the decision are highlighted.
-- These patterns are translated into short textual explanations.
-- This allows users to understand why a particular alert was generated.
+## Known Limitations
+
+- Flow feature extraction depends on an external CICFlowMeter installation (WSL or native), configured per machine via environment variables — see the dashboard README for exact setup.
+- The model is trained offline on labeled flow data and is not updated from live traffic; live capture only drives inference, not retraining.
+- The attack-override threshold is a tunable heuristic on top of raw softmax output, not part of the model itself, and is meant to bias the demo toward flagging suspicious activity rather than to reflect calibrated probability.
 
 ---
 
-## Integrated Application
-All components are combined into a single application workflow:
-- Users provide network traffic data as input.
-- The system returns both the predicted attack type and an explanation.
-- The design supports easy testing, demonstration, and future extensions.
+## Team
 
----
-
-## Summary
-This project demonstrates how network traffic data can be systematically handled, analyzed, and explained using AI-based approaches. By combining threat classification with human-readable explanations, the system highlights the importance of transparency and trust in modern cybersecurity solutions.
+Group project (IT/CSE, NITK Surathkal) — four contributors, developed on individual feature branches and merged into `master` after review. See the top of this repository's git history for the branching and commit conventions used during development.
